@@ -1,0 +1,82 @@
+name: build-unsigned-ipa
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-ipa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: MuQY1818/ds-bot-mobile-app
+          ref: c4e47e03e86b9bd046327a9c0ac411175091d804
+          path: src
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          node --version
+          pod --version
+
+      - name: Install mobile dependencies
+        working-directory: src/apps/mobile
+        run: npm ci --ignore-scripts 2>&1 | tee "$GITHUB_WORKSPACE/npm-ci.log"
+
+      - name: Expo prebuild (iOS)
+        working-directory: src/apps/mobile
+        env:
+          CI: '1'
+        run: npx expo prebuild --platform ios 2>&1 | tee "$GITHUB_WORKSPACE/prebuild.log"
+
+      - name: Build app (unsigned, Release)
+        working-directory: src/apps/mobile/ios
+        run: |
+          set -o pipefail
+          WS=$(ls -d *.xcworkspace | head -1)
+          PROJ=$(ls -d *.xcodeproj | grep -v '^Pods' | head -1)
+          SCHEME=$(basename "$PROJ" .xcodeproj)
+          echo "Workspace=$WS Scheme=$SCHEME"
+          xcodebuild -workspace "$WS" -scheme "$SCHEME" -configuration Release -destination 'generic/platform=iOS' -derivedDataPath "$GITHUB_WORKSPACE/build" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNING_IDENTITY="" build 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP=$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -1)
+          echo "APP=$APP"
+          test -n "$APP"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry DS-Bot-Mobile-0.1.7-unsigned.ipa Payload
+          ls -lh DS-Bot-Mobile-0.1.7-unsigned.ipa
+
+      - name: Publish release with IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ipa-build-${{ github.run_number }}" DS-Bot-Mobile-0.1.7-unsigned.ipa xcodebuild.log --title "Unsigned IPA build ${{ github.run_number }}" --notes "Unsigned IPA of DS Bot Mobile 0.1.7 (upstream MuQY1818/ds-bot-mobile-app @ c4e47e0). Sign it yourself before installing."
+
+      - name: Publish logs on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la *.log || true
+          gh release create "ipa-failed-${{ github.run_number }}" *.log --title "FAILED build ${{ github.run_number }} logs" --notes "Build failed; step logs attached." || true
